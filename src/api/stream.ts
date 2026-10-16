@@ -144,6 +144,15 @@ export function resetConnectedStreamsForTests(): void {
 export const knownLedger: { value: number | null } = { value: null }
 
 /**
+ * Issue #254: track the last reorg ledger height dispatched to clients, to
+ * reject out-of-order reorg signals. If the RPC proxy fails over to a node
+ * slightly behind the previous primary, an older reorg notification arriving
+ * after a newer one would cause clients to unnecessarily rewind their local
+ * state. Monotonic reorg height ensures obsolete rewind signals are discarded.
+ */
+export const lastReorgLedger: { value: number | null } = { value: null }
+
+/**
  * Parse one NOTIFY payload and fan it out to every connected client
  * subscribed to that channel. Exported (rather than kept as a private method
  * on the listener below) so issue #154's malformed-payload guard and issue
@@ -190,6 +199,21 @@ export function dispatchStreamNotification(channel: StreamChannel, rawPayload?: 
     knownLedger.value = ledger
   }
 
+  // Issue #254: reject out-of-order reorg notifications. If a reorg signal
+  // carries a ledger height older than one already dispatched, it's stale
+  // (e.g., from RPC failover to a delayed node) and must be dropped to
+  // prevent clients from rewinding local state unnecessarily.
+  const reorgLedger = payload.reorg_ledger
+  if (typeof reorgLedger === 'number') {
+    if (lastReorgLedger.value !== null && reorgLedger <= lastReorgLedger.value) {
+      console.warn(
+        `[stream] dropping out-of-order reorg notification: reorg_ledger=${reorgLedger} is not newer than last dispatched=${lastReorgLedger.value}`
+      )
+      return
+    }
+    lastReorgLedger.value = reorgLedger
+  }
+
   for (const sc of connectedClients) {
     sc.receiveNotification(channel, payload)
   }
@@ -211,6 +235,7 @@ export function dispatchStreamNotification(channel: StreamChannel, rawPayload?: 
 class SharedListener {
   private client: Client | null = null
   private connecting: Promise<void> | null = null
+  private reconnecting = false
 
   /** Idempotent: connects on first call, a no-op once connected. */
   async ensureStarted(): Promise<void> {
@@ -280,9 +305,21 @@ class SharedListener {
 
     client.on('error', (err) => {
       console.error('[stream] shared listener connection error, will reconnect on next request:', err)
+      // Issue #253: prevent dual listener during reconnection. Lock the
+      // reconnection path to ensure the previous client is fully closed
+      // before a new one is created. Setting `this.client = null` here
+      // means ensureStarted() will reconnect on the next stream request.
+      if (this.reconnecting) {
+        console.warn('[stream] shared listener reconnect already in progress, ignoring redundant error event')
+        return
+      }
+      this.reconnecting = true
+      const deadClient = this.client
       this.client = null
-      client.end().catch(() => {
+      deadClient?.end().catch(() => {
         // Already gone.
+      }).finally(() => {
+        this.reconnecting = false
       })
     })
 
@@ -291,6 +328,11 @@ class SharedListener {
 
   /** Close the standalone connection on process shutdown (src/index.ts). */
   async shutdown(): Promise<void> {
+    // Issue #253: wait for any in-progress reconnection to complete before
+    // shutting down, to avoid closing a client that's being replaced.
+    while (this.reconnecting) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
     const client = this.client
     this.client = null
     if (!client) return

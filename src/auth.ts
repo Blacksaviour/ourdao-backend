@@ -29,15 +29,19 @@ export class AuthFailureTracker {
   private readonly BASE_BACKOFF_MS = 1000 // 1 second
   private readonly MAX_BACKOFF_MS = 60000 // 1 minute
   private readonly FAILURE_WINDOW_MS = 300000 // 5 minutes
+  private readonly MAX_CAPACITY = 10000 // LRU capacity
   private cleanupTimer: NodeJS.Timeout | null = null
 
   constructor() {
-    // Clean up old failure records every minute
+    // Clean up old failure records every minute (issue #258)
     this.cleanupTimer = setInterval(() => {
       const now = Date.now()
-      const staleThreshold = now - this.FAILURE_WINDOW_MS
       for (const [address, record] of this.failures.entries()) {
-        if (record.lastFailureAt < staleThreshold) {
+        // Original cleanup: evict if last failure was more than FAILURE_WINDOW_MS ago
+        const staleSinceLastFailure = record.lastFailureAt < now - this.FAILURE_WINDOW_MS
+        // Issue #258: also evict if backoff expired more than 1 hour ago
+        const staleAfterBackoff = now > record.nextAllowedAt + 3600000
+        if (staleSinceLastFailure || staleAfterBackoff) {
           this.failures.delete(address)
         }
       }
@@ -73,6 +77,22 @@ export class AuthFailureTracker {
   recordFailure(address: string): void {
     const now = Date.now()
     const existing = this.failures.get(address)
+    
+    // Issue #258: enforce LRU capacity to prevent unbounded memory growth
+    if (!existing && this.failures.size >= this.MAX_CAPACITY) {
+      // Find and evict the oldest entry by nextAllowedAt
+      let oldestKey: string | null = null
+      let oldestTime = Infinity
+      for (const [key, record] of this.failures.entries()) {
+        if (record.nextAllowedAt < oldestTime) {
+          oldestTime = record.nextAllowedAt
+          oldestKey = key
+        }
+      }
+      if (oldestKey !== null) {
+        this.failures.delete(oldestKey)
+      }
+    }
     
     if (existing && now - existing.lastFailureAt < this.FAILURE_WINDOW_MS) {
       // Within failure window - increment count and increase backoff
