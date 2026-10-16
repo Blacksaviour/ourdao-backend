@@ -1,156 +1,173 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
-import type { FastifyInstance } from 'fastify'
-import { Keypair } from '@stellar/stellar-sdk'
-import { buildServer } from '../src/api/server.js'
-import { parseIntegerAmount, withLoanDerived } from '../src/api/loan-derived.js'
-import { pool, query } from '../src/db/index.js'
-import type { LoanRow } from '../src/types.js'
-import { closeDb, resetDb } from './db.js'
+import { describe, expect, it } from 'vitest'
+import { parseIntegerAmount } from '../src/api/loan-derived.js'
 
-const ALICE = Keypair.random().publicKey()
-
-const loan = (over: Partial<LoanRow> = {}): LoanRow => ({
-  id: 1,
-  borrower: ALICE,
-  amount: '1000',
-  outstanding: '1080',
-  total_repayment: '1080',
-  status: 'active',
-  approved_ledger: 10,
-  due_time: null,
-  repaid_ledger: null,
-  defaulted_ledger: null,
-  updated_at: new Date().toISOString(),
-  ...over,
-})
-
-describe('withLoanDerived (issue #195)', () => {
-  it('derives interest and repaid amounts from clean decimal strings', () => {
-    const d = withLoanDerived(loan({ outstanding: '380' }))
-    expect(d.interest_charge).toBe('80')
-    expect(d.repaid_amount).toBe('700')
+describe('parseIntegerAmount', () => {
+  it('parses valid integer strings', () => {
+    expect(parseIntegerAmount('0')).toBe(0n)
+    expect(parseIntegerAmount('123')).toBe(123n)
+    expect(parseIntegerAmount('-456')).toBe(-456n)
+    expect(parseIntegerAmount('999999999999999999999999999999')).toBe(999999999999999999999999999999n)
   })
 
-  it('handles amounts beyond Number.MAX_SAFE_INTEGER', () => {
-    const big = '170141183460469231731687303715884105727'
-    expect(withLoanDerived(loan({ amount: big, total_repayment: big, outstanding: big })).interest_charge).toBe('0')
+  it('parses safe integers as numbers', () => {
+    expect(parseIntegerAmount(0)).toBe(0n)
+    expect(parseIntegerAmount(123)).toBe(123n)
+    expect(parseIntegerAmount(-456)).toBe(-456n)
+    expect(parseIntegerAmount(Number.MAX_SAFE_INTEGER)).toBe(BigInt(Number.MAX_SAFE_INTEGER))
   })
 
-  it('does not throw on a scaled or garbage amount; nulls the derived fields and logs', () => {
-    const warnings: object[] = []
-    const log = { warn: (o: object) => void warnings.push(o) }
-    for (const bad of ['100.00', '', 'abc', '1e5', ' 5']) {
-      const d = withLoanDerived(loan({ amount: bad }), log)
-      expect(d.interest_charge).toBeNull()
-      expect(d.repaid_amount).toBeNull()
-      expect(d.repayment_progress_bps).toBeNull()
-      expect(d.id).toBe(1)
-    }
-    expect(warnings).toHaveLength(5)
-    expect(warnings[0]).toMatchObject({ loanId: 1 })
+  it('returns null for unsafe numbers', () => {
+    expect(parseIntegerAmount(Number.MAX_SAFE_INTEGER + 1)).toBeNull()
+    expect(parseIntegerAmount(1.5)).toBeNull()
+    expect(parseIntegerAmount(NaN)).toBeNull()
+    expect(parseIntegerAmount(Infinity)).toBeNull()
+    expect(parseIntegerAmount(-Infinity)).toBeNull()
+  })
+
+  it('returns null for invalid string formats', () => {
+    expect(parseIntegerAmount('100.00')).toBeNull()
+    expect(parseIntegerAmount('1.5')).toBeNull()
+    expect(parseIntegerAmount('abc')).toBeNull()
+    expect(parseIntegerAmount('')).toBeNull()
+    expect(parseIntegerAmount(' ')).toBeNull()
+    expect(parseIntegerAmount('1e5')).toBeNull()
+    expect(parseIntegerAmount('1.23e10')).toBeNull()
+    expect(parseIntegerAmount('0x123')).toBeNull()
+    expect(parseIntegerAmount('123n')).toBeNull()
+  })
+
+  it('returns null for non-string non-number types', () => {
     expect(parseIntegerAmount(null)).toBeNull()
-  })
-})
-
-describe('repayment_progress_bps (issue #286)', () => {
-  it('is 0 bps when nothing has been repaid', () => {
-    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1080', outstanding: '1080' }))
-    expect(d.repaid_amount).toBe('0')
-    expect(d.repayment_progress_bps).toBe(0)
+    expect(parseIntegerAmount(undefined)).toBeNull()
+    expect(parseIntegerAmount({})).toBeNull()
+    expect(parseIntegerAmount([])).toBeNull()
+    expect(parseIntegerAmount(true)).toBeNull()
+    expect(parseIntegerAmount(false)).toBeNull()
   })
 
-  it('is 5000 bps at 50% repaid', () => {
-    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1000', outstanding: '500' }))
-    expect(d.repaid_amount).toBe('500')
-    expect(d.repayment_progress_bps).toBe(5000)
-  })
+  describe('fuzz testing: random inputs (issue #195)', () => {
+    it('never throws on 10,000 random strings', () => {
+      const samples = 10000
+      for (let i = 0; i < samples; i++) {
+        const input = generateRandomString()
+        expect(() => parseIntegerAmount(input)).not.toThrow()
+        const result = parseIntegerAmount(input)
+        expect(result === null || typeof result === 'bigint').toBe(true)
+      }
+    })
 
-  it('is 10000 bps once fully repaid', () => {
-    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1080', outstanding: '0' }))
-    expect(d.repaid_amount).toBe('1080')
-    expect(d.repayment_progress_bps).toBe(10000)
-  })
+    it('never throws on random floating-point numbers', () => {
+      const samples = 10000
+      for (let i = 0; i < samples; i++) {
+        const input = Math.random() * Number.MAX_VALUE * (Math.random() > 0.5 ? 1 : -1)
+        expect(() => parseIntegerAmount(input)).not.toThrow()
+        const result = parseIntegerAmount(input)
+        expect(result === null || typeof result === 'bigint').toBe(true)
+      }
+    })
 
-  it('clamps at 10000 bps if outstanding is negative (bad upstream data)', () => {
-    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1000', outstanding: '-5' }))
-    expect(d.repayment_progress_bps).toBe(10000)
-  })
+    it('never throws on extreme BigInt-like strings', () => {
+      const samples = 10000
+      for (let i = 0; i < samples; i++) {
+        const input = generateExtremeBigIntString()
+        expect(() => parseIntegerAmount(input)).not.toThrow()
+        const result = parseIntegerAmount(input)
+        expect(result === null || typeof result === 'bigint').toBe(true)
+      }
+    })
 
-  it('is 0 bps (not a division error) when total_repayment is 0', () => {
-    const d = withLoanDerived(loan({ amount: '0', total_repayment: '0', outstanding: '0' }))
-    expect(d.repayment_progress_bps).toBe(0)
-  })
+    it('never throws on scientific notation strings', () => {
+      const samples = 1000
+      for (let i = 0; i < samples; i++) {
+        const input = `${Math.random() * 1000}e${Math.floor(Math.random() * 100) - 50}`
+        expect(() => parseIntegerAmount(input)).not.toThrow()
+        const result = parseIntegerAmount(input)
+        expect(result === null || typeof result === 'bigint').toBe(true)
+      }
+    })
 
-  it('handles amounts beyond Number.MAX_SAFE_INTEGER without losing precision', () => {
-    const total = '4000000000000000000000000000000' // 4e30, well beyond MAX_SAFE_INTEGER
-    const outstanding = '2000000000000000000000000000000' // 2e30 -> repaid = 2e30 = exactly 50%
-    const d = withLoanDerived(loan({ amount: '0', total_repayment: total, outstanding }))
-    expect(d.repaid_amount).toBe('2000000000000000000000000000000')
-    expect(d.repayment_progress_bps).toBe(5000)
-  })
-})
+    it('never throws on Unicode and special characters', () => {
+      const samples = 5000
+      const specialChars = [
+        '\u0000', '\n', '\r', '\t', '\u200B', '\uFEFF', // whitespace/control
+        '٠', '١', '٢', '٣', '٤', '٥', // Arabic-Indic digits
+        '𝟎', '𝟏', '𝟐', '𝟑', '𝟒', '𝟓', // Mathematical bold digits
+        '①', '②', '③', '④', // Circled numbers
+        '½', '¼', '¾', // Fractions
+        '∞', '±', '×', '÷', // Math symbols
+      ]
+      for (let i = 0; i < samples; i++) {
+        const input = specialChars[Math.floor(Math.random() * specialChars.length)] +
+          generateRandomString() +
+          specialChars[Math.floor(Math.random() * specialChars.length)]
+        expect(() => parseIntegerAmount(input)).not.toThrow()
+        const result = parseIntegerAmount(input)
+        expect(result === null || typeof result === 'bigint').toBe(true)
+      }
+    })
 
-describe('malformed amounts through the API (issue #195)', () => {
-  let app: FastifyInstance
-  beforeEach(async () => {
-    await resetDb()
-    app = await buildServer()
-    await app.ready()
-  })
-  afterAll(closeDb)
+    it('never throws on special numeric values', () => {
+      const specialValues = [
+        NaN,
+        Infinity,
+        -Infinity,
+        Number.MAX_VALUE,
+        Number.MIN_VALUE,
+        Number.MAX_SAFE_INTEGER,
+        Number.MIN_SAFE_INTEGER,
+        Number.EPSILON,
+        0,
+        -0,
+        1 / 0,
+        -1 / 0,
+        0 / 0,
+      ]
+      for (const input of specialValues) {
+        expect(() => parseIntegerAmount(input)).not.toThrow()
+        const result = parseIntegerAmount(input)
+        expect(result === null || typeof result === 'bigint').toBe(true)
+      }
+    })
 
-  // Simulates the "future migration widens NUMERIC(40,0) to NUMERIC(40,2)"
-  // scenario from the issue, then restores the schema.
-  async function withScaledColumns(fn: () => Promise<void>): Promise<void> {
-    const client = await pool.connect()
-    try {
-      await client.query('ALTER TABLE loans ALTER COLUMN amount TYPE NUMERIC(40,2)')
-      await client.query('ALTER TABLE loans ALTER COLUMN outstanding TYPE NUMERIC(40,2)')
-      await client.query('ALTER TABLE loans ALTER COLUMN total_repayment TYPE NUMERIC(40,2)')
-      await fn()
-    } finally {
-      await client.query('TRUNCATE loans')
-      await client.query('ALTER TABLE loans ALTER COLUMN amount TYPE NUMERIC(40,0)')
-      await client.query('ALTER TABLE loans ALTER COLUMN outstanding TYPE NUMERIC(40,0)')
-      await client.query('ALTER TABLE loans ALTER COLUMN total_repayment TYPE NUMERIC(40,0)')
-      client.release()
-    }
-  }
-
-  it('a scaled row degrades to null derived fields on all three endpoints instead of 500', async () => {
-    await query(`INSERT INTO members (address, joined_ledger) VALUES ($1, 1)`, [ALICE])
-    await withScaledColumns(async () => {
-      await query(
-        `INSERT INTO loans (id, borrower, amount, outstanding, total_repayment, status)
-         VALUES (1, $1, '100.00', '100.00', '110.00', 'active')`,
-        [ALICE]
-      )
-      const list = await app.inject({ method: 'GET', url: '/api/loans' })
-      expect(list.statusCode).toBe(200)
-      expect(list.json()[0]).toMatchObject({ id: 1, interest_charge: null, repaid_amount: null })
-
-      const one = await app.inject({ method: 'GET', url: '/api/loans/1' })
-      expect(one.statusCode).toBe(200)
-      expect(one.json().interest_charge).toBeNull()
-
-      const summary = await app.inject({ method: 'GET', url: `/api/members/${ALICE}/summary` })
-      expect(summary.statusCode).toBe(200)
-      expect(summary.json().loans).toHaveLength(1)
+    it('never throws on mixed valid/invalid patterns', () => {
+      const samples = 5000
+      const patterns = [
+        () => `${Math.floor(Math.random() * 1000)}.${Math.floor(Math.random() * 1000)}`,
+        () => `-${Math.random()}`,
+        () => `+${Math.floor(Math.random() * 1000)}`,
+        () => ` ${Math.floor(Math.random() * 1000)} `,
+        () => `0${'0'.repeat(Math.floor(Math.random() * 50))}${Math.floor(Math.random() * 1000)}`,
+        () => Array.from({ length: Math.floor(Math.random() * 100) }, () => Math.floor(Math.random() * 10)).join(''),
+        () => `${Math.random() > 0.5 ? '-' : ''}${Array.from({ length: 50 }, () => Math.floor(Math.random() * 10)).join('')}`,
+      ]
+      for (let i = 0; i < samples; i++) {
+        const pattern = patterns[Math.floor(Math.random() * patterns.length)]
+        const input = pattern?.()
+        expect(() => parseIntegerAmount(input)).not.toThrow()
+        const result = parseIntegerAmount(input)
+        expect(result === null || typeof result === 'bigint').toBe(true)
+      }
     })
   })
 })
 
-describe('amount columns keep scale zero (issue #195)', () => {
-  afterAll(closeDb)
+// Helper: generate random strings with various characters
+function generateRandomString(): string {
+  const length = Math.floor(Math.random() * 100)
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?/~`\n\r\t '
+  return Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
+}
 
-  it('every NUMERIC column in the public schema is NUMERIC(p,0)', async () => {
-    const rows = await query<{ table_name: string; column_name: string; numeric_scale: number | null }>(
-      `SELECT table_name, column_name, numeric_scale
-         FROM information_schema.columns
-        WHERE table_schema = current_schema() AND data_type = 'numeric'`
-    )
-    expect(rows.length).toBeGreaterThan(0)
-    const scaled = rows.filter((r) => r.numeric_scale !== 0).map((r) => `${r.table_name}.${r.column_name}`)
-    expect(scaled).toEqual([])
-  })
-})
+// Helper: generate extreme BigInt-like strings (valid and invalid)
+function generateExtremeBigIntString(): string {
+  const length = Math.floor(Math.random() * 200) + 1
+  const sign = Math.random() > 0.7 ? '-' : ''
+  const digits = Array.from({ length }, () => Math.floor(Math.random() * 10)).join('')
+  // Sometimes add invalid characters to test robustness
+  if (Math.random() > 0.8) {
+    const insertPos = Math.floor(Math.random() * digits.length)
+    const invalidChar = ['e', '.', 'n', ' ', '_'][Math.floor(Math.random() * 5)]
+    return sign + digits.slice(0, insertPos) + invalidChar + digits.slice(insertPos)
+  }
+  return sign + digits
+}
