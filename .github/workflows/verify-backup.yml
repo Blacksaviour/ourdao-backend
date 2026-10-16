@@ -1,0 +1,121 @@
+name: Database Backup Verification
+
+on:
+  schedule:
+    # Run weekly on Mondays at 02:00 UTC
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      backup_url:
+        description: "Backup file URL or path (optional, uses test backup if not provided)"
+        required: false
+        type: string
+      expected_events:
+        description: "Expected events count (optional)"
+        required: false
+        type: string
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Create test backup for verification
+        if: ${{ !inputs.backup_url }}
+        run: |
+          # Start a test Postgres instance
+          docker run -d \
+            --name test-postgres \
+            -e POSTGRES_PASSWORD=test \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_DB=ourdao_test \
+            -p 5432:5432 \
+            postgres:17
+
+          # Wait for Postgres to be ready
+          sleep 5
+          until docker exec test-postgres pg_isready -U postgres; do
+            echo "Waiting for postgres..."
+            sleep 2
+          done
+
+          # Apply schema
+          docker exec -i test-postgres psql -U postgres -d ourdao_test < src/db/schema.sql
+
+          # Insert test data
+          docker exec -i test-postgres psql -U postgres -d ourdao_test <<EOF
+          INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
+          VALUES 
+            ('0000000000000001', 100, '2024-01-01 00:00:00', 'CTEST', 'joined', '[]', '{}', 'hash1'),
+            ('0000000000000002', 101, '2024-01-01 00:01:00', 'CTEST', 'joined', '[]', '{}', 'hash2'),
+            ('0000000000000003', 102, '2024-01-01 00:02:00', 'CTEST', 'joined', '[]', '{}', 'hash3');
+
+          INSERT INTO members (address, contribution, stake, has_active_loan)
+          VALUES 
+            ('GA...1', '1000', '100', false),
+            ('GA...2', '2000', '200', false);
+
+          INSERT INTO loan_proposals (id, borrower, amount, total_repayment, status)
+          VALUES 
+            (1, 'GA...1', '500', '550', 'approved');
+
+          INSERT INTO loans (id, borrower, amount, outstanding, status)
+          VALUES 
+            (1, 'GA...1', '500', '550', 'active');
+          EOF
+
+          # Create backup
+          docker exec test-postgres pg_dump -U postgres -d ourdao_test > /tmp/test-backup.sql
+
+          # Stop test container
+          docker rm -f test-postgres
+
+          echo "TEST_BACKUP_PATH=/tmp/test-backup.sql" >> $GITHUB_ENV
+          echo "EXPECTED_EVENTS=3" >> $GITHUB_ENV
+
+      - name: Set backup parameters from inputs
+        if: ${{ inputs.backup_url }}
+        run: |
+          echo "TEST_BACKUP_PATH=${{ inputs.backup_url }}" >> $GITHUB_ENV
+          if [ -n "${{ inputs.expected_events }}" ]; then
+            echo "EXPECTED_EVENTS=${{ inputs.expected_events }}" >> $GITHUB_ENV
+          fi
+
+      - name: Run backup verification script
+        run: |
+          if [ -n "${EXPECTED_EVENTS:-}" ]; then
+            ./scripts/verify-backup.sh "$TEST_BACKUP_PATH" "$EXPECTED_EVENTS"
+          else
+            ./scripts/verify-backup.sh "$TEST_BACKUP_PATH"
+          fi
+
+      - name: Report verification results
+        if: always()
+        run: |
+          if [ $? -eq 0 ]; then
+            echo "✅ Backup verification PASSED"
+          else
+            echo "❌ Backup verification FAILED"
+            exit 1
+          fi
+
+      - name: Upload verification logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-logs
+          path: |
+            /tmp/backup-verify*
+          retention-days: 7
