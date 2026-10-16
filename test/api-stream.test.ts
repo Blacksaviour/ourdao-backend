@@ -14,6 +14,7 @@ import {
   dispatchStreamNotification,
   getConnectedStreamCount,
   knownLedger,
+  lastReorgLedger,
   notifyStreamClients,
   notifyStreamClientsOrThrow,
   parseChannelSubset,
@@ -623,6 +624,35 @@ describe('dispatchStreamNotification', () => {
     knownLedger.value = 10
     dispatchStreamNotification(STREAM_CHANNELS.loans, JSON.stringify({ message: 'hi' }))
     expect(knownLedger.value).toBe(10)
+  })
+
+  it('rejects out-of-order reorg notifications (issue #254)', () => {
+    lastReorgLedger.value = null
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    
+    try {
+      // First reorg at ledger 100
+      dispatchStreamNotification(STREAM_CHANNELS.loans, JSON.stringify({ reorg_ledger: 100 }))
+      expect(lastReorgLedger.value).toBe(100)
+
+      // Newer reorg at ledger 105 should be accepted
+      dispatchStreamNotification(STREAM_CHANNELS.loans, JSON.stringify({ reorg_ledger: 105 }))
+      expect(lastReorgLedger.value).toBe(105)
+
+      // Out-of-order reorg at ledger 103 should be rejected
+      dispatchStreamNotification(STREAM_CHANNELS.loans, JSON.stringify({ reorg_ledger: 103 }))
+      expect(lastReorgLedger.value).toBe(105) // unchanged
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('out-of-order reorg notification'))
+
+      // Same reorg ledger should also be rejected
+      warnSpy.mockClear()
+      dispatchStreamNotification(STREAM_CHANNELS.loans, JSON.stringify({ reorg_ledger: 105 }))
+      expect(lastReorgLedger.value).toBe(105) // unchanged
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('out-of-order reorg notification'))
+    } finally {
+      warnSpy.mockRestore()
+      lastReorgLedger.value = null
+    }
   })
 })
 

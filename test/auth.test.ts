@@ -626,4 +626,38 @@ describe('AuthFailureTracker — per-address exponential backoff (issues #183, #
     expect(failures.size).toBe(0)
     tracker.shutdown()
   })
+
+  it('enforces LRU capacity to prevent unbounded memory growth (issue #258)', () => {
+    const tracker = newTracker()
+    const MAX_CAPACITY = (tracker as unknown as { MAX_CAPACITY: number }).MAX_CAPACITY
+    const failures = (tracker as unknown as { failures: Map<string, { nextAllowedAt: number }> }).failures
+
+    // Fill the map to capacity
+    for (let i = 0; i < MAX_CAPACITY; i++) {
+      tracker.recordFailure(`GA-ADDR-${i}`)
+    }
+    expect(failures.size).toBe(MAX_CAPACITY)
+
+    // Adding one more should evict the oldest entry by nextAllowedAt
+    tracker.recordFailure('GA-NEW')
+    expect(failures.size).toBe(MAX_CAPACITY)
+    expect(failures.has('GA-NEW')).toBe(true)
+    tracker.shutdown()
+  })
+
+  it('periodic cleanup evicts entries where backoff expired >1 hour ago (issue #258)', () => {
+    vi.useFakeTimers()
+    const tracker = newTracker()
+    // Record a failure with 1 second backoff
+    tracker.recordFailure('GA-OLD-BACKOFF')
+    const record = recordOf(tracker, 'GA-OLD-BACKOFF')
+    expect(record).toBeDefined()
+    expect(record.count).toBe(1)
+
+    // Advance time past backoff expiry + 1 hour + a bit
+    vi.advanceTimersByTime(1000 + 3600000 + 60000)
+    const failures = (tracker as unknown as { failures: Map<string, unknown> }).failures
+    expect(failures.size).toBe(0)
+    tracker.shutdown()
+  })
 })

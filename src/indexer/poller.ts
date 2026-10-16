@@ -674,10 +674,26 @@ export async function fetchOnce(contractId: string): Promise<void> {
   // ledger we already folded to, the chain rewound past applied history.
   const tip = await getLatestLedgerInfo()
   const priorLedger = cursor?.last_ledger ?? 0
+  const observedTip = cursor?.observed_tip_ledger ?? 0
+  
+  // Issue #257: if the RPC tip moved backwards but is still ahead of what
+  // we've actually folded, this is likely RPC failover to a slightly delayed
+  // node, not a genuine reorg. Allow a small grace window (10 ledgers) to
+  // tolerate multi-node RPC pool latency without false alarms.
+  const GRACE_WINDOW = 10
   if (priorLedger > 0 && tip.sequence < priorLedger) {
-    throw new ReorgDetectedError(
-      `RPC latest ledger ${tip.sequence} is below the last folded ledger ${priorLedger} — the chain rewound past applied history`
-    )
+    const drift = priorLedger - tip.sequence
+    if (observedTip > 0 && drift <= GRACE_WINDOW && tip.sequence >= priorLedger - GRACE_WINDOW) {
+      console.warn(
+        `[indexer] RPC tip drifted backward by ${drift} ledgers (${tip.sequence} < observed ${observedTip}), ` +
+        `but still within grace window — likely RPC failover, not reorg`
+      )
+      // Continue without throwing; the tip will catch up on the next poll
+    } else {
+      throw new ReorgDetectedError(
+        `RPC latest ledger ${tip.sequence} is below the last folded ledger ${priorLedger} — the chain rewound past applied history`
+      )
+    }
   }
 
   // Same-height fork check (issue #128): the coarse check above only catches
@@ -905,6 +921,20 @@ export async function runIndexer(): Promise<void> {
             // Issue #191: persist the halt before exiting so it outlives the
             // process and its logs, and so the next start refuses to resume.
             await recordReorgHalt(contractId, err)
+            // Issue #254: notify stream clients with monotonic reorg ledger
+            // height before halting, so they can resync from a known point.
+            const cursor = await loadCursor(contractId)
+            const reorgLedger = cursor?.last_ledger ?? 0
+            try {
+              await notifyStreamClientsAfterCommit(STREAM_CHANNELS.loans, {
+                type: 'resync',
+                reorg_ledger: reorgLedger,
+                message: 'Ledger discontinuity detected',
+                timestamp: Date.now(),
+              })
+            } catch (notifyErr) {
+              console.error('[indexer] failed to notify clients of reorg:', notifyErr)
+            }
             // Reorg halt is deliberate and permanent for this run — don't
             // reset, so the caller must explicitly restart (issue #48).
             throw err
