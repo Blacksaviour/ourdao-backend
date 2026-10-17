@@ -237,9 +237,12 @@ async function touchCursor(contractId: string): Promise<void> {
   await pool.query('UPDATE indexer_cursor SET updated_at = now() WHERE contract_id = $1', [contractId])
 }
 
-/** Determine the ledger to start from on a cold start (no saved cursor). */
+/** Determine the ledger to start from on a cold start (no saved cursor).
+ *  Issue #267: clamps the result to at least 1 so a reorg detected on early
+ *  ledgers (within startLookbackLedgers of genesis) can never produce an
+ *  invalid sequence for RPC queries. */
 async function resolveStartLedger(): Promise<number> {
-  if (config.indexer.startLedger > 0) return config.indexer.startLedger
+  if (config.indexer.startLedger > 0) return Math.max(1, config.indexer.startLedger)
   const latest = await getLatestLedger()
   return Math.max(1, latest - config.indexer.startLookbackLedgers)
 }

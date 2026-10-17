@@ -13,16 +13,62 @@ export const server = new rpc.Server(config.stellar.rpcUrl, {
   ...(Object.keys(rpcHeaders).length > 0 ? { headers: rpcHeaders } : {}),
 })
 
+/** Issue #268: Retry with exponential backoff on HTTP 429 rate limit */
+async function withRateLimitRetry<T>(
+  fn: () => Promise<T>,
+  operation: string,
+  maxRetries = 5
+): Promise<T> {
+  let attempt = 0
+  while (true) {
+    try {
+      return await fn()
+    } catch (err: unknown) {
+      const isRateLimited =
+        err &&
+        typeof err === 'object' &&
+        ('code' in err && err.code === 429) ||
+        ('status' in err && err.status === 429) ||
+        (err instanceof Error && (err.message.includes('429') || err.message.toLowerCase().includes('rate limit')))
+
+      if (!isRateLimited || attempt >= maxRetries) {
+        throw err
+      }
+
+      attempt++
+      // Exponential backoff with jitter: base delay 2^attempt seconds, plus random jitter up to 1s
+      const baseDelay = Math.min(1000 * 2 ** attempt, 32000)
+      const jitter = Math.random() * 1000
+      const delay = baseDelay + jitter
+
+      console.warn(
+        `[rpc] ${operation} rate-limited (429), retry ${attempt}/${maxRetries} after ${Math.round(delay)}ms`
+      )
+      await new Promise((resolve) => setTimeout(resolve, delay))
+    }
+  }
+}
+
 export async function getLatestLedger(): Promise<number> {
-  const res = await server.getLatestLedger()
-  return res.sequence
+  return withRateLimitRetry(
+    async () => {
+      const res = await server.getLatestLedger()
+      return res.sequence
+    },
+    'getLatestLedger'
+  )
 }
 
 /** Latest-ledger sequence plus its hash (`id`) — used for the coarse rewind
  *  signal in reorg detection (issue #23). */
 export async function getLatestLedgerInfo(): Promise<{ sequence: number; hash: string }> {
-  const res = await server.getLatestLedger()
-  return { sequence: res.sequence, hash: res.id }
+  return withRateLimitRetry(
+    async () => {
+      const res = await server.getLatestLedger()
+      return { sequence: res.sequence, hash: res.id }
+    },
+    'getLatestLedgerInfo'
+  )
 }
 
 /** Hash of a specific ledger by sequence. Soroban's `getEvents` exposes no
