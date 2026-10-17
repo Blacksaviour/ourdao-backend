@@ -18,4 +18,19 @@ export class ConcurrencyGate {
   release(): void {
     this.active -= 1
   }
+
+  /** Issue #272: Guaranteed-release helper that executes `fn` with automatic
+   *  cleanup on all exit paths (success, error, synchronous throw). Prevents
+   *  capacity leaks when a route handler throws before reaching its manual
+   *  `finally` block. */
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.tryAcquire()) {
+      throw new Error('ConcurrencyGate: capacity exhausted')
+    }
+    try {
+      return await fn()
+    } finally {
+      this.release()
+    }
+  }
 }
