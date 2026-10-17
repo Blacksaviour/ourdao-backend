@@ -146,9 +146,11 @@ async function notify(
   message: string
 ): Promise<void> {
   if (!address) return
+  // Issue #271: use ON CONFLICT to prevent duplicate notifications during replay
   await client.query(
     `INSERT INTO notifications (address, type, title, message, ledger, tx_hash, event_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (event_id, address) WHERE event_id IS NOT NULL DO NOTHING`,
     [address, type, title, message, ev.ledger, ev.txHash, ev.id]
   )
 }
