@@ -407,13 +407,14 @@ export function getCursorWriteFailures(): { error: string; at: number } | null {
 
 async function recordQuarantinedEvent(ev: DecodedEvent, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error)
-  // Issue #171: fold failures of the same event into one row via UNIQUE constraint.
-  // ON CONFLICT updates the row so the latest error message is recorded.
+  // Issue #171, #260: fold failures of the same event into one row via UNIQUE constraint.
+  // ON CONFLICT updates the row so the latest error message is recorded, and resets
+  // resolved_at to NULL for events that were previously resolved but failed again.
   try {
     await pool.query(
       `INSERT INTO failed_events (event_id, symbol, ledger, error, created_at)
        VALUES ($1, $2, $3, $4, now())
-       ON CONFLICT (event_id) DO UPDATE SET error = $4, created_at = now()`,
+       ON CONFLICT (event_id) DO UPDATE SET error = $4, created_at = now(), resolved_at = NULL`,
       [ev.id, ev.symbol, ev.ledger, message]
     )
   } catch (insertErr) {

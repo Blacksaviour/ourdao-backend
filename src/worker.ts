@@ -78,7 +78,7 @@ async function main(): Promise<void> {
 
     maintenanceAbort.abort()
 
-    // Wait for the indexer loop to finish its current page and exit,
+    // Issue #261: Wait for the indexer loop to finish its current page and exit,
     // bounded so a wedged RPC call can't hang shutdown forever (issue #47).
     const stopPromise = stopIndexer()
     let timedOut = false
@@ -103,12 +103,13 @@ async function main(): Promise<void> {
       )
     }
 
-    // The maintenance loop only checks its abort signal between runs (or
+    // Issue #261: The maintenance loop only checks its abort signal between runs (or
     // right after connecting), so it isn't raced here the way the indexer
     // is above — a maintenance run in flight when shutdown starts is a plain
     // VACUUM/DELETE using its own dedicated connection, entirely independent
     // of `pool`, and finishes (or fails) on its own without blocking this.
-    void maintenance.stopped
+    // Wait for it to complete before closing the pool.
+    await maintenance.stopped
 
     console.log('[indexer] closing database pool')
     await pool.end()

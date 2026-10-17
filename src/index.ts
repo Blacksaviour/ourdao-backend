@@ -2,7 +2,7 @@ import { config } from './config.js'
 import { migrate } from './db/migrate.js'
 import { pool } from './db/index.js'
 import { buildServer, shutdownNonceStore } from './api/server.js'
-import { shutdownSharedListener } from './api/stream.js'
+import { shutdownSharedListener, drainStreamClients } from './api/stream.js'
 
 const SHUTDOWN_TIMEOUT_MS = 10_000
 
@@ -42,6 +42,11 @@ async function main(): Promise<void> {
         `app.close() timed out after ${SHUTDOWN_TIMEOUT_MS}ms — continuing with pool/listener shutdown anyway`
       )
     }
+
+    // Issue #261: Drain all active SSE stream clients before closing the pool,
+    // giving them time to complete any in-flight writes. This prevents
+    // "Connection terminated unexpectedly" errors during graceful shutdown.
+    await drainStreamClients()
 
     // Issue #152 / #207: the /api/stream shared listener holds a standalone
     // connection outside `pool`, and every open SSE connection holds a pool

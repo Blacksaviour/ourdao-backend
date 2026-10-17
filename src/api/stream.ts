@@ -365,6 +365,20 @@ class SharedListener {
 const sharedListener = new SharedListener()
 
 /**
+ * Issue #261: Drain all active SSE stream clients before shutdown.
+ * Closes all connected clients gracefully, giving them time to complete
+ * any in-flight writes before the pool is closed.
+ */
+export async function drainStreamClients(): Promise<void> {
+  const clients = Array.from(connectedClients)
+  if (clients.length === 0) return
+  
+  console.log(`[stream] draining ${clients.length} active SSE client(s)`)
+  await Promise.all(clients.map((client) => client.close()))
+  console.log('[stream] all SSE clients drained')
+}
+
+/**
  * Close the shared listener's standalone connection. Call this during
  * graceful shutdown (src/index.ts), before `pool.end()` — the listener's
  * connection is deliberately outside `pool`, so `pool.end()` never waits on
