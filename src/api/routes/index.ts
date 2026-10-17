@@ -1339,16 +1339,20 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     // allowed to be shed. A cache miss never waits behind another expensive
     // recomputation: preserving ordinary reads is more useful than making a
     // dashboard poll queue until the request pool is exhausted.
-    if (!statsGate.tryAcquire()) {
-      reply.header('Retry-After', String(config.http.statsRetryAfterSeconds))
-      return reply.code(503).send({ error: 'stats temporarily unavailable; retry shortly' })
-    }
-
+    // Issue #272: use gate.run() for guaranteed release on all exit paths
     try {
-      const value = await computeStats()
-      statsCache = { at: Date.now(), value }
-      return { ...value, connectedStreams: liveStreams }
+      const result = await statsGate.run(async () => {
+        const value = await computeStats()
+        statsCache = { at: Date.now(), value }
+        return { ...value, connectedStreams: liveStreams }
+      })
+      return result
     } catch (err) {
+      // If the gate is exhausted, return 503 immediately
+      if (err instanceof Error && err.message === 'ConcurrencyGate: capacity exhausted') {
+        reply.header('Retry-After', String(config.http.statsRetryAfterSeconds))
+        return reply.code(503).send({ error: 'stats temporarily unavailable; retry shortly' })
+      }
       // A successful prior value remains useful during a transient database
       // failure. Surface that it is stale while retaining the normal shape.
       if (statsCache) {
@@ -1357,8 +1361,6 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
         return { ...statsCache.value, connectedStreams: liveStreams }
       }
       throw err
-    } finally {
-      statsGate.release()
     }
   })
 
