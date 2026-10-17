@@ -702,10 +702,19 @@ export async function fetchOnce(contractId: string): Promise<void> {
   // changes the hash of the ledger already folded to. Compare what's stored
   // for `priorLedger` (issue #127: genuinely its hash now, not the tip's)
   // against what the RPC reports for that same sequence today.
+  // Issue #259: handle null hash return when ledger has aged out of RPC
+  // retention window — fall back to sequence-only verification rather than
+  // throwing, and log an informative warning.
   if (priorLedger > 0 && cursor?.last_ledger_hash) {
     const actualHash = await getLedgerHash(priorLedger)
-    // null means the RPC has pruned that ledger — unverifiable, not a fork.
-    if (actualHash !== null && actualHash !== cursor.last_ledger_hash) {
+    if (actualHash === null) {
+      // Ledger has aged out of RPC retention window — unverifiable, not a fork
+      console.warn(
+        `[indexer] ledger ${priorLedger} hash unavailable (aged out of RPC retention window) — ` +
+        `falling back to sequence-only verification. Historical reindexing past retention window ` +
+        `cannot verify same-height forks.`
+      )
+    } else if (actualHash !== cursor.last_ledger_hash) {
       throw new ReorgDetectedError(
         `ledger ${priorLedger}'s hash changed from ${cursor.last_ledger_hash} to ${actualHash} — history diverged at the same height`
       )
