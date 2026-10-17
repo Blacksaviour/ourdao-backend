@@ -1,6 +1,7 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { PoolClient } from 'pg'
 import { pool } from './index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -12,6 +13,31 @@ const migrationsDir = join(here, 'migrations')
 // IF NOT EXISTS makes that harmless for schema.sql's CREATE statements, but
 // a real ALTER (see migrations/) is not safe to run twice in parallel.
 const MIGRATION_LOCK_KEY = 0x0d40_0000
+
+/** Issue #256: Try to acquire the migration advisory lock with a timeout,
+ *  using pg_try_advisory_lock in a polling loop. Returns true if the lock
+ *  was acquired, false if the timeout elapsed without acquiring it. */
+async function acquireMigrationLockWithTimeout(
+  client: PoolClient,
+  lockKey: number,
+  timeoutMs: number
+): Promise<boolean> {
+  const startTime = Date.now()
+  const pollIntervalMs = 100
+
+  while (Date.now() - startTime < timeoutMs) {
+    const result = await client.query<{ pg_try_advisory_lock: boolean }>(
+      'SELECT pg_try_advisory_lock($1)',
+      [lockKey]
+    )
+    if (result.rows[0]?.pg_try_advisory_lock) {
+      return true
+    }
+    // Lock not acquired yet, wait before retrying
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+  }
+  return false
+}
 
 export interface MigrationFile {
   version: number
@@ -81,7 +107,18 @@ async function loadMigrationFiles(): Promise<MigrationFile[]> {
 export async function migrate(): Promise<void> {
   const client = await pool.connect()
   try {
-    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY])
+    // Issue #256: use pg_try_advisory_lock with polling loop instead of blocking
+    // pg_advisory_lock to prevent indefinite hangs if a previous migration process
+    // died while holding the lock.
+    const lockAcquired = await acquireMigrationLockWithTimeout(client, MIGRATION_LOCK_KEY, 30000)
+    if (!lockAcquired) {
+      throw new Error(
+        'Failed to acquire migration lock within 30 seconds. Another migration may be in progress, ' +
+        'or a previous migration process may have died while holding the lock. ' +
+        'If you are certain no other migration is running, restart the database connection pool ' +
+        'to clear stale session locks.'
+      )
+    }
     // Issue #196: a migration (an ALTER over a large table) may legitimately
     // outlast the pool's default statement_timeout. Lift it for this session
     // only; restored in the finally below before the client returns to the pool.
