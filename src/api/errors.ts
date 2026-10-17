@@ -162,6 +162,21 @@ export function registerErrorHandling(app: FastifyInstance): void {
     done()
   })
 
+  // Issue #270: Ensure CORS headers are present on error responses.
+  // @fastify/cors only runs for normal responses; 404s and unhandled errors
+  // bypass it. Manually attach CORS headers here to every 4xx/5xx so frontend
+  // clients receive actionable error messages instead of opaque CORS failures.
+  app.addHook('onSend', (req, reply, _payload, done) => {
+    if (reply.statusCode >= 400 && !reply.hasHeader('Access-Control-Allow-Origin')) {
+      const origin = req.headers.origin
+      if (origin) {
+        reply.header('Access-Control-Allow-Origin', origin)
+        reply.header('Access-Control-Allow-Credentials', 'true')
+      }
+    }
+    done()
+  })
+
   // Unmatched routes get the same envelope as everything else.
   app.setNotFoundHandler((req, reply) => {
     reply.code(404).send({ error: 'route not found', code: 'ROUTE_NOT_FOUND', correlationId: req.id } satisfies ErrorEnvelope)

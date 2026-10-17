@@ -375,7 +375,10 @@ const handlers: Record<string, Handler> = {
     // Fold principal lent once per loan (issue #24). `xmax = 0` is true only
     // when this was a fresh INSERT, not the ON CONFLICT UPDATE branch — so a
     // re-delivered `loan_appr` doesn't double-count.
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
     if (loanIns.rows[0]?.is_new) {
+      await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
       await client.query(
         `UPDATE dao_totals SET principal_lent = principal_lent + $1, updated_at = now() WHERE id = 1`,
         [amount]
@@ -409,7 +412,10 @@ const handlers: Record<string, Handler> = {
       [loanId, outstanding, status, ev.ledger]
     )
     const loan = upd.rows[0]
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
     if (status === 'repaid' && loan && !loan.was_repaid) {
+      await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
       await client.query(
         `UPDATE dao_totals SET principal_repaid = principal_repaid + $1, updated_at = now() WHERE id = 1`,
         [loan.amount]
@@ -445,6 +451,9 @@ const handlers: Record<string, Handler> = {
     // The status guard above already makes this fold idempotent (issue #24):
     // value defaulted is the loan's outstanding balance at the moment it
     // defaulted.
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
+    await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
     await client.query(
       `UPDATE dao_totals SET value_defaulted = value_defaulted + $1, updated_at = now() WHERE id = 1`,
       [updated.rows[0]?.outstanding ?? '0']
@@ -516,7 +525,10 @@ const handlers: Record<string, Handler> = {
        ON CONFLICT (event_id) DO NOTHING`,
       [ev.id, ev.ledger, amount, num(f.active), ev.txHash]
     )
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
     if (inserted.rowCount === 1) {
+      await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
       await client.query(
         `UPDATE dao_totals
             SET interest_collected = interest_collected + $1, updated_at = now()
