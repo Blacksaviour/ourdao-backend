@@ -21,7 +21,6 @@ describe('API: CORS headers on error responses (issue #270)', () => {
     })
     expect(res.statusCode).toBe(404)
     expect(res.headers['access-control-allow-origin']).toBe('http://localhost:3000')
-    expect(res.headers['access-control-allow-credentials']).toBe('true')
     const body = res.json()
     expect(body.error).toBe('route not found')
     expect(body.code).toBe('ROUTE_NOT_FOUND')
@@ -61,7 +60,6 @@ describe('API: CORS headers on error responses (issue #270)', () => {
     })
     expect(res.statusCode).toBe(400)
     expect(res.headers['access-control-allow-origin']).toBe('http://localhost:3000')
-    expect(res.headers['access-control-allow-credentials']).toBe('true')
   })
 
   it('CORS headers work with multiple configured origins', async () => {

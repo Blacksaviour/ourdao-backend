@@ -171,7 +171,6 @@ export function registerErrorHandling(app: FastifyInstance): void {
       const origin = req.headers.origin
       if (origin) {
         reply.header('Access-Control-Allow-Origin', origin)
-        reply.header('Access-Control-Allow-Credentials', 'true')
       }
     }
     done()
