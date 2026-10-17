@@ -218,8 +218,12 @@ export class MemoryNonceStore implements NonceStore {
       throw new NonceStoreCapacityError(`Too many outstanding nonces for ${truncateAddress(address)}`)
     }
 
-    // Generate a random 32-byte nonce (64 hex chars)
-    const nonce = randomBytes(32).toString('hex')
+    // Issue #266: Generate a timestamp-prefixed nonce (8 hex chars timestamp + 56 hex chars random)
+    // to enable early expiration checks without hitting the database
+    const timestamp = Date.now()
+    const timestampHex = timestamp.toString(16).padStart(8, '0')
+    const randomHex = randomBytes(28).toString('hex') // 28 bytes = 56 hex chars
+    const nonce = timestampHex + randomHex
 
     this.store.set(nonce, {
       address,
@@ -311,7 +315,12 @@ export class PostgresNonceStore implements NonceStore {
     // two concurrent requests to both generate and store nonces. With nonce as the
     // primary key (issue #180), each call gets a distinct nonce stored atomically.
     const expiresAt = new Date(Date.now() + this.ttlMs)
-    const nonce = randomBytes(32).toString('hex')
+    // Issue #266: Generate a timestamp-prefixed nonce (8 hex chars timestamp + 56 hex chars random)
+    // to enable early expiration checks without hitting the database
+    const timestamp = Date.now()
+    const timestampHex = timestamp.toString(16).padStart(8, '0')
+    const randomHex = randomBytes(28).toString('hex') // 28 bytes = 56 hex chars
+    const nonce = timestampHex + randomHex
 
     // Insert the new nonce. Each nonce is unique, so this is atomic and race-free.
     const result = await this.pool.query(
@@ -498,6 +507,27 @@ export async function authenticateRequest(
     logger?.warn(`[auth] authentication failed: reason=missing_headers has_address=${!!address} has_signature=${!!signature} has_nonce=${!!nonce}`)
     authStats.verificationsFailed.missingHeaders++
     return { authenticated: false, status: 401, error: 'Missing authentication headers' }
+  }
+
+  // Issue #266: Parse and validate nonce timestamp before querying database.
+  // Nonces are 64-character hex strings; the first 8 characters encode the
+  // unix milliseconds timestamp when the nonce was issued. Reject expired
+  // nonces immediately without hitting the database to mitigate replay DoS.
+  try {
+    const timestampHex = nonce.slice(0, 8)
+    const timestamp = Number.parseInt(timestampHex, 16)
+    const age = Date.now() - timestamp
+    const maxAge = 300000 // 300 seconds in milliseconds
+    
+    if (age > maxAge || age < 0) {
+      logger?.warn(`[auth] authentication failed: reason=expired_nonce address=${truncateAddress(address)} age_ms=${age}`)
+      authStats.verificationsFailed.invalidNonce++
+      failureTracker?.recordFailure(address)
+      return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
+    }
+  } catch (parseError) {
+    // Malformed nonce format — let it hit the database and fail there naturally
+    logger?.debug(`[auth] nonce timestamp parse failed, will verify via database: ${parseError}`)
   }
 
   // Check if this address is currently under backoff (issue #184)

@@ -277,11 +277,14 @@ const handlers: Record<string, Handler> = {
     const proposalId = requireId(ev, 'proposal_id')
     const support = requireBool(ev, 'support')
     const column = support ? 'votes_for' : 'votes_against'
+    // Issue #265: Default null weight to 1 without corrupting cumulative vote tallies.
+    // weightOf() already handles this safely by returning '1' when weight is null/undefined.
+    const weight = weightOf(ev)
     await client.query(
       `UPDATE loan_proposals
          SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
        WHERE id = $1`,
-      [proposalId, weightOf(ev)]
+      [proposalId, weight]
     )
   },
 
