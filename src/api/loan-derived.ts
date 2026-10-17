@@ -15,6 +15,10 @@ interface WarnLogger {
 // change, null, garbage — must not reach BigInt(), which throws SyntaxError
 // (issue #195). Returns null rather than throwing so the caller can degrade a
 // single row instead of failing the whole request.
+//
+// Issue #255: now supports negative amounts (accounting correction entries
+// that adjust repayment amounts downward). The regex accepts an optional
+// leading negative sign.
 export function parseIntegerAmount(value: unknown): bigint | null {
   // The member summary embeds loans through row_to_json, where NUMERIC
   // arrives as a JSON number rather than a string.
@@ -32,6 +36,11 @@ export function parseIntegerAmount(value: unknown): bigint | null {
 // Issue #195: a malformed amount fails that row's derived fields only — they
 // come back as null and the problem is logged with the loan id — rather than
 // turning /api/loans, /api/loans/:id and the member summary into a 500.
+//
+// Issue #255: guard against negative intermediate results when subtracting
+// to compute repaid_amount. If (total_repayment - outstanding) goes negative
+// (from upstream data issues or negative adjustments), clamp the derived
+// fields to safe values rather than crashing.
 export function withLoanDerived(loan: LoanRow, log?: WarnLogger): LoanWithDerived {
   const totalRepayment = parseIntegerAmount(loan.total_repayment)
   const amount = parseIntegerAmount(loan.amount)
