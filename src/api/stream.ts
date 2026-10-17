@@ -303,8 +303,26 @@ class SharedListener {
       dispatchStreamNotification(msg.channel as StreamChannel, msg.payload)
     })
 
+    // Issue #264: catch database connection errors to prevent unhandled
+    // rejections that would crash the Node.js process. When the Postgres
+    // server restarts or the connection drops, notify all connected SSE
+    // clients so they know to reconnect.
     client.on('error', (err) => {
       console.error('[stream] shared listener connection error, will reconnect on next request:', err)
+      
+      // Notify all connected SSE clients about the disconnect so they can
+      // trigger a client-side reconnect. Send a disconnect message on all
+      // channels to ensure every active client receives the signal.
+      for (const sc of connectedClients) {
+        for (const channel of Object.values(STREAM_CHANNELS)) {
+          sc.receiveNotification(channel as StreamChannel, {
+            type: 'disconnect',
+            reason: 'database_connection_lost',
+            message: 'Database connection lost, please reconnect',
+          })
+        }
+      }
+      
       // Issue #253: prevent dual listener during reconnection. Lock the
       // reconnection path to ensure the previous client is fully closed
       // before a new one is created. Setting `this.client = null` here

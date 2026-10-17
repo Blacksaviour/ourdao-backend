@@ -421,7 +421,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     },
   }, async (req, reply) => {
     setCachePolicy(reply, 'public-live')
-    if (!validAddress(req.params.address)) {
+    // Issue #263: normalize address to uppercase before validation and query.
+    // Stellar addresses are case-insensitive but Postgres stores the canonical
+    // uppercase form, so mixed-case lookups would return zero results.
+    const rawAddress = req.params.address
+    const address = rawAddress.toUpperCase()
+    
+    if (!validAddress(address)) {
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
     const q = req.query as Record<string, unknown>
@@ -447,7 +453,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     // docs/member-activity-query-plan.md.
     const params: unknown[] = [
       symbolFilter ?? (MEMBER_ACTIVITY_SYMBOLS as unknown as string[]),
-      req.params.address,
+      address,
     ]
     let where = symbolFilter !== undefined
       ? `WHERE symbol = $1 AND data @> to_jsonb($2::text)`
@@ -859,6 +865,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     const before = cursor(q.before)
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
 
+    // Issue #262: set cache policy for document queries to ensure ETag
+    // generation is deterministic, especially for empty result sets.
     setCachePolicy(reply, historicalOrLive(before !== null))
 
     const params: unknown[] = []
