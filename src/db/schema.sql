@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS notifications_address_idx ON notifications (address, read);
 CREATE INDEX IF NOT EXISTS notifications_event_id_address_idx ON notifications (event_id, address);
+CREATE UNIQUE INDEX IF NOT EXISTS notifications_event_id_address_uniq ON notifications (event_id, address) WHERE event_id IS NOT NULL;
 
 -- Lifetime money aggregates folded from the raw event log (issue #24).
 -- Single row (id = 1). O(1) to read; kept in sync as events fold, and
@@ -364,3 +365,15 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
 CREATE INDEX IF NOT EXISTS admin_audit_log_admin_address_idx ON admin_audit_log (admin_address, created_at DESC);
 CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx ON admin_audit_log (action, created_at DESC);
 CREATE INDEX IF NOT EXISTS admin_audit_log_created_at_idx ON admin_audit_log (created_at DESC);
+
+-- Append-only enforcement (migration 0032).
+CREATE OR REPLACE FUNCTION admin_audit_log_immutable() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'admin_audit_log is append-only (% not allowed)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS admin_audit_log_no_update_delete ON admin_audit_log;
+CREATE TRIGGER admin_audit_log_no_update_delete
+  BEFORE UPDATE OR DELETE ON admin_audit_log
+  FOR EACH ROW EXECUTE FUNCTION admin_audit_log_immutable();
